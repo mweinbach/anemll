@@ -304,6 +304,8 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 | DeepHermes | 3B, 8B | 512-1024 | ✅ Yes | 🟢 Stable |
 | Qwen 3 | 0.6B, 4B | 512-2048 | ⚠️ Experimental | 🟡 Alpha |
 | Qwen 2.5 | 0.5B, 1.5B, 3B, 7B | 512-2048 | ⚠️ Experimental | 🟡 Alpha |
+| Gemma 3 (text-only) | 1B | 8K-32K | HF + ANE LM head | 🟡 Alpha |
+| Gemma 3n (text) | 4B | 512-32768 | ⚠️ Experimental | IN PROGRESS |
 
 ### 🎯 **ANE Performance Notes**
 - **Recommended context**: 512-1024 tokens for best performance
@@ -315,6 +317,17 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 - **Additional Qwen 2.5 variants** (14B, 32B)
 - **Mistral family** support
 - **Gemma models**
+
+## Gemma 3 (1B Instruct) on ANE
+
+- Status: text-only model supported for Hugging Face inference. Initial ANE conversion supports the final normalization + LM head projection, enabling offload of the largest matmul to the Neural Engine.
+- Convert the LM head to CoreML:
+  - `python -m anemll.ane_converter.gemma3_converter --model google/gemma-3-1b-it --output outputs/gemma3 --prefix gemma3_1b --part 3`
+  - This produces `outputs/gemma3/gemma3_1b_lm_head.mlpackage` and a compiled `.mlmodelc`.
+- Quick validation (optionally):
+  - `python tests/dev/test_gemma3_lm_head_coreml.py` (requires the compiled head and will skip if missing)
+- Notes:
+  - Full end-to-end ANE conversion (embeddings/FFN/prefill with KV cache) is under development. The existing LLaMA/Qwen split pipeline remains the reference path for production ANE perf.
 - **Enhanced quantization** (GPTQ, SpinQuant integration)
 - **Larger context lengths** (4K, 8K optimization)
 
@@ -357,6 +370,8 @@ Feel free to submit issues and pull requests to improve **ANEMLL**!
 
 ### Integration Examples
 For examples of how to integrate ANEMLL into your projects, see:
+
+- Qwen 3 conversion: see `docs/qwen3.md` (includes Qwen3-1.7B commands)
 - [iOS Integration Guide](./docs/sample_apps.md)
 - [Swift CLI Reference](./docs/swift_cli.md)
 - [Python Sample Code](./docs/chat.md)

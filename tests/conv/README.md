@@ -44,9 +44,16 @@ Python wrapper that uses test_hf_model.sh to test LLaMA models:
 
 ### test_qwen_model.py
 Python wrapper that uses test_hf_model.sh to test Qwen models:
-- Qwen3 0.6B
+- Qwen3 0.6B (default)
+- Qwen3 1.7B (set ANEMLL_RUN_HEAVY=1)
 
 **Usage**: `python tests/test_qwen_model.py`
+
+To include the 1.7B variant as well:
+
+```bash
+ANEMLL_RUN_HEAVY=1 python tests/test_qwen_model.py
+```
 
 ## Common Features
 - **Auto-downloads models**: No need for manual model setup

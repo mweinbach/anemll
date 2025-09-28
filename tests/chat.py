@@ -196,20 +196,73 @@ def load_model(path, function_name=None):
     """Load a CoreML model, handling both .mlmodelc and .mlpackage formats."""
     path = Path(path)
     compute_unit = ct.ComputeUnit.CPU_AND_NE
+
+    class CoreMLModelWrapper:
+        def __init__(self, model, function=None):
+            self.model = model
+            self.function = function
+
+        def predict(self, inputs, state=None):
+            def _allowed_input_names(m):
+                try:
+                    desc = getattr(m, 'input_description', None)
+                    if desc is None:
+                        return None
+                    # Mapping-like
+                    if hasattr(desc, 'keys'):
+                        return set(desc.keys())
+                    if hasattr(desc, 'items'):
+                        return set([k for k, _ in desc.items()])
+                    # Iterable of FeatureDescription
+                    try:
+                        return set([getattr(fd, 'name', None) for fd in desc if getattr(fd, 'name', None)])
+                    except Exception:
+                        return None
+                except Exception:
+                    return None
+
+            if isinstance(self.model, ct.models.MLModel):
+                if self.function:
+                    try:
+                        self.model.function_name = self.function
+                    except AttributeError:
+                        pass
+                if self.function:
+                    allowed = _allowed_input_names(self.model)
+                    filtered = {k: v for k, v in inputs.items() if (allowed is None or k in allowed)}
+                    return self.model.predict(filtered, state=state)
+                return self.model.predict(inputs, state=state)
+            else:
+                # Compiled model
+                if self.function:
+                    return self.model.predict(inputs, function_name=self.function)
+                return self.model.predict(inputs)
+
+        def make_state(self):
+            if hasattr(self.model, 'make_state'):
+                return self.model.make_state()
+            raise Exception("This CoreML model does not provide make_state().")
+
+        @property
+        def input_names(self):
+            if hasattr(self.model, 'input_description'):
+                return set(self.model.input_description.keys())
+            return set()
+
+        def __getattr__(self, item):
+            return getattr(self.model, item)
     
     try:
         if path.suffix == '.mlmodelc':
             # For compiled models (.mlmodelc), use CompiledMLModel
             if function_name:
-                return ct.models.CompiledMLModel(str(path), compute_unit, function_name=function_name)
+                return CoreMLModelWrapper(ct.models.CompiledMLModel(str(path), compute_unit, function_name=function_name), function_name)
             else:
-                return ct.models.CompiledMLModel(str(path), compute_unit)
+                return CoreMLModelWrapper(ct.models.CompiledMLModel(str(path), compute_unit))
         else:
             # For packages (.mlpackage)
-            if function_name:
-                return ct.models.MLModel(str(path), function_name=function_name)
-            else:
-                return ct.models.MLModel(str(path))
+            model = ct.models.MLModel(str(path))
+            return CoreMLModelWrapper(model, function_name)
                 
     except RuntimeError as e:
         if "valid manifest does not exist" in str(e):
@@ -326,7 +379,13 @@ def load_models(args,metadata):
         # Load embeddings model
         if not args.eval:
             print("\nLoading embeddings model...")
-        embed_path = parse_model_path(args.embed)
+        def resolve_path(p):
+            p = Path(p)
+            if not p.is_absolute():
+                return str((Path(args.d) / p).resolve())
+            return str(p)
+
+        embed_path = parse_model_path(resolve_path(args.embed))
         if not args.eval:
             print(f"Loading from: {embed_path}")
         embed_model = load_model(embed_path)
@@ -339,7 +398,7 @@ def load_models(args,metadata):
         # Load LM head model
         if not args.eval:
             print("\nLoading LM head model...")
-        lmhead_path = parse_model_path(args.lmhead)
+        lmhead_path = parse_model_path(resolve_path(args.lmhead))
         if not args.eval:
             print(f"Loading from: {lmhead_path}")
         lmhead_model = load_model(lmhead_path)
@@ -349,7 +408,7 @@ def load_models(args,metadata):
         # Parse FFN path and find chunks if needed
         if not args.eval:
             print("\nLoading FFN+PREFILL model(s)...")
-        ffn_path = parse_model_path(args.ffn)
+        ffn_path = parse_model_path(resolve_path(args.ffn))
         chunk_no, total_chunks = parse_ffn_filename(ffn_path)
         
         ffn_models = []
@@ -365,7 +424,7 @@ def load_models(args,metadata):
                 if not args.eval:
                     print(f"\nLoading FFN+PREFILL chunk: {Path(chunk_path).name}")
                 try:
-                    # For chunked models, we need both infer and prefill functions
+                    # Preferred: combined multifunction model with infer/prefill functions
                     ffn_models.append({
                         'infer': load_model(chunk_path, function_name='infer'),
                         'prefill': load_model(chunk_path, function_name='prefill')
@@ -373,15 +432,74 @@ def load_models(args,metadata):
                     if not args.eval:
                         print("Chunk loaded successfully")
                 except Exception as e:
+                    # Fallback: separate FFN and prefill models per chunk
                     if not args.eval:
                         print(f"Error loading chunk {chunk_path}: {str(e)}")
-                    raise
+                        print("Falling back to separate FFN and prefill models for this chunk...")
+                    try:
+                        p = Path(chunk_path)
+                        base_dir = p.parent
+                        name = p.name
+                        # Determine FFN path
+                        ffn_candidates = [
+                            base_dir / name.replace("FFN_PF", "FFN"),
+                            base_dir / (name.replace("FFN_PF", "FFN") + ".mlpackage"),
+                            base_dir / (name.replace("FFN_PF", "FFN") + ".mlmodelc"),
+                        ]
+                        ffn_path = None
+                        for cand in ffn_candidates:
+                            if cand.exists():
+                                ffn_path = cand
+                                break
+                        if ffn_path is None:
+                            ffn_path = base_dir / name.replace("FFN_PF", "FFN")
+
+                        # Determine prefill path (prefer explicit argument)
+                        if args.prefill:
+                            pf_path = parse_model_path(args.prefill)
+                        else:
+                            pf_candidates = [
+                                base_dir / name.replace("FFN_PF", "prefill"),
+                                base_dir / (name.replace("FFN_PF", "prefill") + ".mlpackage"),
+                                base_dir / (name.replace("FFN_PF", "prefill") + ".mlmodelc"),
+                            ]
+                            pf_path = None
+                            for cand in pf_candidates:
+                                if Path(cand).exists():
+                                    pf_path = cand
+                                    break
+                            if pf_path is None:
+                                pf_path = pf_candidates[0]
+
+                        # Final string paths
+                        ffn_path = resolve_path(ffn_path)
+                        pf_path = resolve_path(pf_path)
+                        if not args.eval:
+                            print(f"  Using FFN: {Path(ffn_path).name}")
+                            print(f"  Using PF:  {Path(pf_path).name}")
+                        ffn_models.append({
+                            'infer': load_model(ffn_path),
+                            'prefill': load_model(pf_path)
+                        })
+                        if not args.eval:
+                            print("Fallback chunk loaded successfully")
+                    except Exception as e2:
+                        if not args.eval:
+                            print(f"Fallback failed for chunk {chunk_path}: {str(e2)}")
+                        raise
             metadata = load_metadata(ffn_models[0],args)
 
         else:
             if not args.eval:
                 print("\nLoading single FFN model...")
-            ffn_models.append(load_model(ffn_path))
+            if args.prefill:
+                pf_path = parse_model_path(resolve_path(args.prefill))
+                ffn_models.append({
+                    'infer': load_model(ffn_path),
+                    'prefill': load_model(pf_path)
+                })
+            else:
+                ffn_models.append(load_model(ffn_path))
             if not args.eval:
                 print("FFN model loaded successfully")
         
@@ -468,8 +586,68 @@ def initialize_causal_mask(context_length, eval_mode=False):
         print(f"\nInitialized causal mask for context length {context_length}")
     return causal_mask
 
-def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, batch_size=64, state=None, causal_mask=None):
+def _embed_token(embed_model, tok_np):
+    """Embed a single token and apply Gemma's sqrt(H) scaling."""
+    import numpy as _np
+    import torch as _torch
+    out = embed_model.predict({'input_ids': tok_np.astype(_np.int32)})['hidden_states']
+    ts = _torch.from_numpy(out).to(_torch.float16)
+    if ts.numel() > 0:
+        hs = ts.shape[-1]
+        ts = ts * (float(hs) ** 0.5)
+    return ts
+
+
+def _stepwise_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, state=None, causal_mask=None, eval_mode=False):
+    """Fallback prefill: iterate tokens and run FFN infer to build KV state.
+
+    This avoids using the dedicated prefill Core ML function (which may fail
+    to compile on some graphs) and still populates the model's KV cache.
+    """
+    import numpy as _np
+    import torch as _torch
+
+    if not eval_mode:
+        print("\nUsing CPU/stepwise prefill fallback (iterating tokens via infer)")
+
+    for pos in range(int(context_pos)):
+        tok = input_ids[:, pos:pos + 1]
+        hidden_states = _embed_token(embed_model, tok.numpy())  # [1,1,H]
+
+        # Build a single-row causal mask for this position
+        if causal_mask is None:
+            from numpy import full, float16
+            cm = full((1, 1, 1, context_length), -_np.inf, dtype=_np.float16)
+            cm[0, 0, 0, : pos + 1] = 0.0
+            single_causal = _torch.tensor(cm, dtype=_torch.float16)
+        else:
+            single_causal = causal_mask[:, :, pos:pos + 1, :]
+
+        position_ids = _torch.tensor([pos], dtype=_torch.int32)
+
+        # Run through FFN chunks with state using 'infer'
+        for ffn_model in ffn_models:
+            if isinstance(ffn_model, dict):
+                inputs = {
+                    'hidden_states': hidden_states.numpy().astype(_np.float16),
+                    'position_ids': position_ids.numpy().astype(_np.int32),
+                    'causal_mask': single_causal.numpy().astype(_np.float16),
+                    'current_pos': position_ids.numpy().astype(_np.int32)
+                }
+                allowed = getattr(ffn_model['infer'], 'input_names', None)
+                if allowed:
+                    inputs = {k: v for k, v in inputs.items() if k in allowed}
+                # State may be None if the backend cannot create one; it will still run
+                _ = ffn_model['infer'].predict(inputs, state)
+
+    return _torch.tensor([context_pos], dtype=_torch.int32)
+
+
+def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, batch_size=64, state=None, causal_mask=None, cpu_fallback=False, eval_mode=False):
     """Run prefill on the input sequence."""
+    # Optional explicit fallback
+    if cpu_fallback:
+        return _stepwise_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, state, causal_mask, eval_mode)
     # Use provided causal mask or create one if not provided
     if causal_mask is None:
         causal_mask = make_causal_mask(context_length, 0)
@@ -484,35 +662,47 @@ def run_prefill(embed_model, ffn_models, input_ids, context_pos, context_length,
         # Get current batch
         batch_input = input_ids[:, batch_pos:batch_end]
         
-        # Always pad to full batch size for prefill
-        batch_input = F.pad(
-            batch_input,
-            (0, batch_size - current_batch_size),
-            value=0
-        )
-        
         # Generate position IDs for full batch size
-        position_ids = torch.arange(batch_pos, batch_pos+batch_size, dtype=torch.int32)  # Changed: Always use full batch size
-        batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos+batch_size, :]  # Changed: Use full batch size
-        
-        # Run embeddings
-        hidden_states = torch.from_numpy(
-            embed_model.predict({
-                'input_ids': batch_input.numpy().astype(np.int32)
-            })['hidden_states']
-        )
-        
+        position_ids = torch.arange(batch_pos, batch_pos + batch_size, dtype=torch.int32)
+        batch_causal_mask = causal_mask[:, :, batch_pos:batch_pos + batch_size, :]
+
+        # Run embeddings token-by-token (embedding model expects seq len = 1)
+        hidden_tensors = []
+        for tok_idx in range(current_batch_size):
+            tok = batch_input[:, tok_idx:tok_idx + 1]
+            embed_ts = _embed_token(embed_model, tok.numpy())
+            hidden_tensors.append(embed_ts)
+        hidden_states = torch.cat(hidden_tensors, dim=1)
+        # Pad hidden states to full batch size if needed
+        if current_batch_size < batch_size:
+            hidden_size = hidden_states.shape[-1]
+            padded = torch.zeros((1, batch_size, hidden_size), dtype=hidden_states.dtype)
+            if current_batch_size > 0:
+                padded[:, :current_batch_size, :] = hidden_states
+            hidden_states = padded
+
         # Run through FFN chunks with state
         for ffn_model in ffn_models:
             if isinstance(ffn_model, dict):
-                inputs = {
-                    'hidden_states': hidden_states.numpy().astype(np.float16),  # [1, 64, hidden_size]
-                    'position_ids': position_ids.numpy().astype(np.int32),    # [64]
-                    'causal_mask': batch_causal_mask.numpy().astype(np.float16), # [1, 1, 64, context_length]
-                    'current_pos': np.array([batch_pos], dtype=np.int32)  # [1]
+                pos_ids = position_ids.numpy().astype(np.int32)  # rank-1 by default
+                base_inputs = {
+                    'hidden_states': hidden_states.numpy().astype(np.float16),
+                    'position_ids': pos_ids,
+                    'causal_mask': batch_causal_mask.numpy().astype(np.float16),
+                    'current_pos': np.array([batch_pos], dtype=np.int32)
                 }
-                output = ffn_model['prefill'].predict(inputs, state)
-                hidden_states = torch.from_numpy(output['output_hidden_states'])
+                allowed = getattr(ffn_model['prefill'], 'input_names', None)
+                def _filter(d):
+                    return {k: v for k, v in d.items() if (allowed is None or k in allowed)}
+                try:
+                    # Try rank-1 first
+                    output = ffn_model['prefill'].predict(_filter(base_inputs), state)
+                    hidden_states = torch.from_numpy(output['output_hidden_states'])
+                except Exception as e:
+                    # If dedicated prefill fails, fall back to stepwise prefill
+                    if not eval_mode:
+                        print(f"Prefill path failed: {e}\nFalling back to stepwise prefill via infer...")
+                    return _stepwise_prefill(embed_model, ffn_models, input_ids, context_pos, context_length, state, causal_mask, eval_mode)
         
         batch_pos = batch_end
     
@@ -527,13 +717,8 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     current_token_array = current_token.numpy().astype(np.int32)
     
     # Run embeddings
-    hidden_states = torch.from_numpy(
-        embed_model.predict({'input_ids': current_token_array})['hidden_states']
-    )  # [1, 1, hidden_size]
+    hidden_states = _embed_token(embed_model, current_token_array)  # [1, 1, hidden_size]
     
-    # Create masks
-    update_mask = torch.zeros((1, 1, context_length, 1), dtype=torch.float16)
-    update_mask[0, 0, pos-1, 0] = 1.0
     position_ids = torch.tensor([pos-1], dtype=torch.int32)  # [1]
     
     # Use provided causal mask or create one if not provided
@@ -548,11 +733,13 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
         if isinstance(ffn_model, dict):
             inputs = {
                 'hidden_states': hidden_states.numpy().astype(np.float16),
-                'update_mask': update_mask.numpy().astype(np.float16),
                 'position_ids': position_ids.numpy().astype(np.int32),
                 'causal_mask': single_causal_mask.numpy().astype(np.float16),
                 'current_pos': position_ids.numpy().astype(np.int32)
             }
+            allowed = getattr(ffn_model['infer'], 'input_names', None)
+            if allowed:
+                inputs = {k: v for k, v in inputs.items() if k in allowed}
             output = ffn_model['infer'].predict(inputs, state)
             hidden_states = torch.from_numpy(output['output_hidden_states'])
     
@@ -592,17 +779,27 @@ def create_unified_state(ffn_models, context_length, eval_mode=False):
     """Create unified KV cache state for transformer."""
     if isinstance(ffn_models[0], dict):
         # Use first FFN model's prefill function to create state
-        state = ffn_models[0]['prefill'].make_state()
-        if not eval_mode:
-            print(f"\nCreated unified transformer state for {len(ffn_models)} chunks")
-        return state
+        try:
+            state = ffn_models[0]['prefill'].make_state()
+            if not eval_mode:
+                print(f"\nCreated unified transformer state for {len(ffn_models)} chunks")
+            return state
+        except Exception as e:
+            if not eval_mode:
+                print(f"\nUnable to create CoreML state object ({e}); falling back to None")
+            return None
     else:
-        state = ffn_models[0].make_state()
-        if not eval_mode:
-            print("\nCreated unified transformer state")
-        return state
+        try:
+            state = ffn_models[0].make_state()
+            if not eval_mode:
+                print("\nCreated unified transformer state")
+            return state
+        except Exception as e:
+            if not eval_mode:
+                print(f"\nUnable to create CoreML state object ({e}); falling back to None")
+            return None
 
-def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None, no_template=False, eval_mode=False):
+def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask=None, auto_prompt=None, warmup=False, save_file=None, max_tokens=None, no_template=False, eval_mode=False, cpu_fallback=False):
     """Interactive chat loop."""
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
@@ -612,6 +809,19 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
         print("\nStarting chat session. Press Ctrl+D to exit.")
         print("Type your message and press Enter to chat.")
     
+    # Gemma helpers
+    def _is_gemma(tok):
+        name = getattr(tok, "__class__", type(tok)).__name__.lower()
+        path = getattr(tok, "name_or_path", "").lower()
+        return ("gemma" in name) or ("gemma" in path)
+
+    def _has_gemma_turn_tokens(tok):
+        try:
+            vocab = tok.get_vocab()
+            return ("<start_of_turn>" in vocab) and ("<end_of_turn>" in vocab)
+        except Exception:
+            return False
+
     # Check if tokenizer has chat template and if it works
     has_chat_template = False
     try:
@@ -646,6 +856,13 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
             if not user_input:
                 continue
             
+            # Record user message for potential manual template reconstruction
+            # (chat template path rebuilds from messages each turn)
+            # We append now so manual Gemma formatting can include history.
+            # For chat template path, this extra append is harmless.
+            # It will be updated with assistant content later.
+            conversation.append({"role": "user", "content": user_input})
+
             # Format prompt based on no_template flag and tokenizer capabilities
             if no_template:
                 # Use raw input without any chat template formatting
@@ -657,20 +874,39 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                 if not warmup and not eval_mode:
                     print("Using raw input without chat template")
             elif has_chat_template:
-                messages = [{"role": "user", "content": user_input}]
+                messages = conversation[-1:]
                 input_ids = tokenizer.apply_chat_template(
                     messages,
                     return_tensors="pt",
                     add_generation_prompt=True
                 ).to(torch.int32)
             else:
-                # Manual formatting for Llama models without chat template
-                formatted_prompt = f"[INST] {user_input} [/INST]"
-                input_ids = tokenizer(
-                    formatted_prompt,
-                    return_tensors="pt",
-                    add_special_tokens=True
-                ).input_ids.to(torch.int32)
+                # Manual formatting fallback
+                if _is_gemma(tokenizer) and _has_gemma_turn_tokens(tokenizer):
+                    bos = tokenizer.bos_token or ""
+                    text = bos
+                    for msg in conversation:
+                        if msg.get("role") == "user":
+                            text += f"<start_of_turn>user\n{msg.get('content','')}<end_of_turn>\n"
+                        elif msg.get("role") == "assistant":
+                            text += f"<start_of_turn>model\n{msg.get('content','')}<end_of_turn>\n"
+                    # Add generation prompt for model turn
+                    text += "<start_of_turn>model\n"
+                    input_ids = tokenizer(
+                        text,
+                        return_tensors="pt",
+                        add_special_tokens=False
+                    ).input_ids.to(torch.int32)
+                    if not warmup and not eval_mode:
+                        print("Using Gemma manual chat template")
+                else:
+                    # Generic Llama-style fallback
+                    formatted_prompt = f"[INST] {user_input} [/INST]"
+                    input_ids = tokenizer(
+                        formatted_prompt,
+                        return_tensors="pt",
+                        add_special_tokens=True
+                    ).input_ids.to(torch.int32)
             
             context_pos = input_ids.size(1)
             
@@ -700,7 +936,9 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     context_length,
                     batch_size,
                     state,
-                    causal_mask
+                    causal_mask,
+                    cpu_fallback=cpu_fallback,
+                    eval_mode=eval_mode
                 )
                 
                 # Calculate prefill timing
@@ -831,6 +1069,8 @@ def parse_args():
                        help='Path to embeddings model (relative to --dir)')
     parser.add_argument('--ffn', type=str, required=False,
                        help='Path to FFN model (can be chunked, relative to --dir)')
+    parser.add_argument('--prefill', type=str, required=False,
+                       help='Path to prefill model (optional, relative to --dir)')
     parser.add_argument('--lmhead', type=str, required=False,
                        help='Path to LM head model (relative to --dir)')
     parser.add_argument('--tokenizer', type=str, required=False,
@@ -859,6 +1099,11 @@ def parse_args():
     # Add eval mode flag
     parser.add_argument('--eval', action='store_true',
                        help='Evaluation mode: suppress all output except model response')
+    # CPU prefill fallback for Gemma3 ANE
+    parser.add_argument('--gemma3-ane-cpufallback', dest='gemma3_ane_cpufallback', action='store_true',
+                       help='Force CPU/stepwise prefill via infer when dedicated prefill fails or is unavailable')
+    parser.add_argument('--cpu-prefill-fallback', dest='gemma3_ane_cpufallback', action='store_true',
+                       help='Alias for --gemma3-ane-cpufallback')
     
     # Model configuration
     parser.add_argument('--context-length', type=int,
@@ -892,11 +1137,13 @@ def parse_args():
             
             # Set model paths if not specified
             if not args.lmhead:
-                args.lmhead = f'{prefix}_lm_head{lut_lmhead}'
+                args.lmhead = params.get('lm_head', f'{prefix}_lm_head{lut_lmhead}')
             if not args.embed:
-                args.embed = f'{prefix}_embeddings{lut_embeddings}'  # Changed from lm_head to embeddings
+                args.embed = params.get('embeddings', f'{prefix}_embeddings{lut_embeddings}')
             if not args.ffn:
-                args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
+                args.ffn = params.get('ffn', f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}')
+            if not args.prefill and 'prefill' in params:
+                args.prefill = params['prefill']
             if not args.tokenizer:
                 # Check if there's a tokenizer_path parameter in meta.yaml
                 if 'tokenizer_path' in params:
@@ -1038,7 +1285,8 @@ def main():
                     warmup=True,
                     auto_prompt="who are you?",
                     no_template=args.no_template,
-                    eval_mode=args.eval
+                    eval_mode=args.eval,
+                    cpu_fallback=args.gemma3_ane_cpufallback
                 )
         
         # Main run
@@ -1055,7 +1303,8 @@ def main():
             save_file=args.save,
             max_tokens=args.max_tokens,
             no_template=args.no_template,
-            eval_mode=args.eval
+            eval_mode=args.eval,
+            cpu_fallback=args.gemma3_ane_cpufallback
         )
         
     except Exception as e:

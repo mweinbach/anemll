@@ -1,24 +1,27 @@
-# Qwen 3 Conversion Guide
+Qwen 3 on ANE (0.6B, 1.7B, 4B)
 
-This document explains how to convert Qwen 3 checkpoints for use with the ANEMLL
-pipeline. The process mirrors the existing Llama flow and works for models up to
-8&nbsp;B parameters.
+This guide shows how to convert and compile Qwen 3 models for Apple Neural Engine using ANEMLL.
 
-## Usage
+Quick start (Qwen3-1.7B):
 
-```bash
-./anemll/utils/convert_model.sh --model <path_to_qwen3> --output <out> --prefix qwen
-```
+- One‑shot test script
+  - `./tests/conv/test_hf_model.sh Qwen/Qwen3-1.7B /tmp/qwen3-1.7b 2`
+- Or use the staged converter directly
+  - `./anemll/utils/convert_model.sh --model ~/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/<snap>`
+    `--output /tmp/qwen3-1.7b --prefix qwen --context 1024 --batch 64 --chunk 2 --lut2 4 --lut3 6`
 
-After conversion you can run inference with the Python chat script:
+Notes
 
-```bash
-python tests/chat.py --meta <out>/meta.yaml
-```
+- Converter selection
+  - Qwen3 uses the Qwen converter (`anemll.ane_converter.qwen_converter`)
+  - Qwen2.5 uses the Qwen 2.5 converter (`anemll.ane_converter.qwen2_5_converter`)
+  - The tooling detects Qwen3 even if `model_type` is `qwen2` by inspecting `architectures` (QwenForCausalLM)
+- Tokenizer
+  - iOS config uses `Qwen2Tokenizer` and `model_type: qwen3`
+- Recommended settings
+  - Context length: 512–1024 for best ANE performance
+  - Chunking: `--chunk 2` for 1.7B; adjust if you hit compile limits
+  - Quantization: `--lut2 4` (FFN/prefill), `--lut3 6` (LM head)
+- Chat testing
+  - `python tests/chat.py --meta /tmp/qwen3-1.7b/meta.yaml --prompt "Hello" --max-tokens 64`
 
-## Notes
-
-* Only 4-D tensors are produced to comply with ANE requirements.
-* LM head layers are automatically sliced when the width exceeds 16&nbsp;384.
-* Both the 0.6&nbsp;B development checkpoint and the 8&nbsp;B model have been
-validated.

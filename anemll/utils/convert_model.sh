@@ -143,20 +143,42 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)" || {
 # Detect architecture from config.json
 CONFIG_FILE="$MODEL_PATH/config.json"
 if [ -f "$CONFIG_FILE" ]; then
-    ARCH=$(jq -r '.model_type // (.architectures[0] // "")' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
-    # Check for Qwen2 (which is Qwen 2.5) or Qwen2ForCausalLM architecture
-    if [[ "$ARCH" == "qwen2" ]] || [[ "$ARCH" == *"qwen2forcausallm"* ]]; then
+    # Read both model_type and architectures[0] to disambiguate Qwen 2.5 vs Qwen 3
+    MODEL_TYPE=$(jq -r '.model_type // empty' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
+    ARCH_CLASS=$(jq -r '.architectures[0] // empty' "$CONFIG_FILE" | tr '[:upper:]' '[:lower:]')
+    # Fallback ARCH value for downstream metadata
+    ARCH=${MODEL_TYPE:-$ARCH_CLASS}
+
+    # Decide converter with precedence on explicit architecture class names
+    if [[ "$ARCH_CLASS" == *"qwen2forcausallm"* ]]; then
+        # Qwen 2.x / 2.5
         CONVERTER="python3 -m anemll.ane_converter.qwen2_5_converter"
-        # Use "qwen25" as default prefix for Qwen 2.5 models unless explicitly set
-        if [ "$PREFIX" = "llama" ]; then
-            PREFIX="qwen25"
-        fi
-    elif [[ "$ARCH" == qwen* ]]; then
+        if [ "$PREFIX" = "llama" ]; then PREFIX="qwen25"; fi
+        ARCH="qwen2"  # Normalize
+    elif [[ "$ARCH_CLASS" == *"qwen3forcausallm"* ]] || [[ "$ARCH_CLASS" == *"qwenforcausallm"* ]] || [[ "$MODEL_TYPE" == "qwen3" ]] || [[ "$MODEL_TYPE" == "qwen" ]]; then
+        # Qwen 3 uses QwenForCausalLM; some configs still say model_type=qwen2
         CONVERTER="python3 -m anemll.ane_converter.qwen_converter"
-        # Use "qwen" as default prefix for Qwen models unless explicitly set
-        if [ "$PREFIX" = "llama" ]; then
-            PREFIX="qwen"
-        fi
+        if [ "$PREFIX" = "llama" ]; then PREFIX="qwen"; fi
+        ARCH="qwen3"  # Normalize for metadata
+    elif [[ "$MODEL_TYPE" == "qwen2" ]]; then
+        # If only model_type is available and says qwen2, assume Qwen 2.5
+        CONVERTER="python3 -m anemll.ane_converter.qwen2_5_converter"
+        if [ "$PREFIX" = "llama" ]; then PREFIX="qwen25"; fi
+        ARCH="qwen2"
+    elif [[ "$MODEL_TYPE" == "gemma3n" ]] || [[ "$MODEL_TYPE" == "gemma3n_text" ]]; then
+        CONVERTER="python3 -m anemll.ane_converter.gemma3n_converter"
+        if [ "$PREFIX" = "llama" ]; then PREFIX="gemma3n"; fi
+    elif [[ "$MODEL_TYPE" == "gemma3_text" ]] || [[ "$ARCH_CLASS" == *"gemma3forcausallm"* ]]; then
+        # Gemma3 ANE split converter (embeddings/FFN/prefill/LM head)
+        CONVERTER="python3 -m anemll.ane_converter.gemma3_ane_converter"
+        if [ "$PREFIX" = "llama" ]; then PREFIX="gemma3"; fi
+        echo "Detected Gemma 3 text model. Using split ANE converter."
+        ARCH="gemma3"
+    elif [[ "$MODEL_TYPE" == qwen* ]] || [[ "$ARCH_CLASS" == qwen* ]]; then
+        # Generic Qwen fallback → Qwen 3 converter
+        CONVERTER="python3 -m anemll.ane_converter.qwen_converter"
+        if [ "$PREFIX" = "llama" ]; then PREFIX="qwen"; fi
+        ARCH="qwen3"
     else
         CONVERTER="python3 -m anemll.ane_converter.llama_converter"
     fi
@@ -308,8 +330,13 @@ fi
 # Step 6: Compile Models - Always run compilation for all parts that have LUT specified
 run_step 6 "Compiling Models Part 1" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 1 ${LUT_PART1:+--lut $LUT_PART1} --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
 run_step 6 "Compiling Models Part 3" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 3 ${LUT_PART3:+--lut $LUT_PART3} --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
-if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
-    run_step 6 "Compiling Models Part 2" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 2 ${LUT_PART2:+--lut $LUT_PART2} --chunk $NUM_CHUNKS --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
+# For Gemma3 ANE, keep FFN_PF as .mlpackage (multifunction); compiled mlmodelc breaks function_name loading
+if [ "$ARCH" != "gemma3" ]; then
+    if [ -z "$ONLY_STEP" ] || [ "$ONLY_STEP" = "2" ]; then
+        run_step 6 "Compiling Models Part 2" "python3 \"$PROJECT_ROOT/anemll/utils/compile_models.py\" 2 ${LUT_PART2:+--lut $LUT_PART2} --chunk $NUM_CHUNKS --prefix \"$PREFIX\" --input \"$OUTPUT_DIR\" --output \"$OUTPUT_DIR\""
+    fi
+else
+    echo "Skipping compile of Part 2 for Gemma3 to preserve multi-function model (FFN+Prefill)."
 fi
 
 # Step 7: Copy tokenizer files and create meta.yaml
@@ -326,6 +353,7 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
     run_step 7 "Copying tokenizer files and creating meta.yaml" "
         # Copy tokenizer files if they exist
         (cp \"$MODEL_PATH/tokenizer.json\" \"$OUTPUT_DIR/\" || true) && \
+        (cp \"$MODEL_PATH/tokenizer.model\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/tokenizer_config.json\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/vocab.json\" \"$OUTPUT_DIR/\" || true) && \
         (cp \"$MODEL_PATH/merges.txt\" \"$OUTPUT_DIR/\" || true) && \
@@ -333,7 +361,7 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
         # Create config.json if it doesn't exist
         if [ ! -f \"$OUTPUT_DIR/config.json\" ]; then
             echo \"Creating config.json for iOS tokenizer...\" && \
-            if [[ \"$ARCH\" == \"qwen2\" ]] || [[ \"$ARCH\" == *\"qwen2forcausallm\"* ]]; then
+            if [[ \"$ARCH\" == \"qwen2\" ]] || [[ \"$ARCH_CLASS\" == *\"qwen2forcausallm\"* ]]; then
                 # Create Qwen 2.5-specific config.json
                 cat > \"$OUTPUT_DIR/config.json\" <<'EOF_CONFIG'
 {
@@ -355,10 +383,11 @@ EOF_CONFIG
         fi && \
         
         # Create meta.yaml with correct LUT values based on actual file existence
-        python3 \"$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py\" \
-            \"$MODEL_NAME\" \"$CONTEXT_LENGTH\" \"$BATCH_SIZE\" \
-            \"${LUT_PART1:-none}\" \"${LUT_PART2:-none}\" \"${LUT_PART3:-none}\" \
-            $NUM_CHUNKS \"$PREFIX\" \"$ARCH\" \"$OUTPUT_DIR\"
+        python3 "$PROJECT_ROOT/anemll/utils/generate_meta_yaml.py" \
+            "$MODEL_NAME" "$CONTEXT_LENGTH" "$BATCH_SIZE" \
+            "${LUT_PART1:-none}" "${LUT_PART2:-none}" "${LUT_PART3:-none}" \
+            $NUM_CHUNKS "$PREFIX" "$ARCH" "$OUTPUT_DIR" "$MODEL_PATH"
+
     "
 fi
 

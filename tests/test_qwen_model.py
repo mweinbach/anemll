@@ -38,6 +38,19 @@ def run_qwen_tests():
             "chunks": "1"
         }
     ]
+
+    # Optionally include a heavier Qwen3-1.7B smoke test when explicitly enabled
+    # Enable by setting: ANEMLL_RUN_HEAVY=1
+    if os.environ.get("ANEMLL_RUN_HEAVY", "0") == "1":
+        test_cases.append(
+            {
+                "name": "Qwen3 1.7B",
+                "model": "Qwen/Qwen3-1.7B",
+                "output": "/tmp/test-qwen-1.7b",
+                # Use chunking to fit ANE limits during conversion/compilation
+                "chunks": "2",
+            }
+        )
     
     for test_case in test_cases:
         print(f"\n--- Testing {test_case['name']} ---")
