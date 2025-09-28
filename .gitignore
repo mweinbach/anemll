@@ -40,3 +40,35 @@ xcuserdata/
 *.xcuserstate
 *.xcworkspacexcuserdata/
 =*
+
+# Models and weights (do not commit large artifacts)
+models/
+weights/
+checkpoints/
+output/
+outputs/
+artifacts/
+
+# Common weight file formats
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.ggml
+*.onnx
+
+# Core ML artifacts
+*.mlmodel
+*.mlpackage
+*.mlmodelc/
+
+# Local Hugging Face caches (if created inside repo)
+huggingface/
+hf_cache/
+
+# Misc large archives produced during conversion
+*.tar
+*.tar.gz
+*.zip
