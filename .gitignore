@@ -24,7 +24,11 @@ anemll-swift-cli/.build/
 lib/
 bin/
 share/
-./*.logs/  # logs / test results
+# Logs / test results
+*.log
+*.logs/
+logs/
+test-results/
 evaluate/results/
 results/
 # macOS system files
@@ -40,3 +44,28 @@ xcuserdata/
 *.xcuserstate
 *.xcworkspacexcuserdata/
 =*
+
+# Python virtualenvs and tooling caches
+.venv/
+.venv-*/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Environment files and local config
+.env
+.env.*
+.idea/
+.vscode/
+
+# Model assets and run outputs (root-level only)
+/models/
+/outputs/
+/artifacts/
+/checkpoints/
+/runs/
