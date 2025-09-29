@@ -68,9 +68,9 @@ if [ "$SKIP_CHECK" = false ]; then
     fi
 
     # Check coremltools version
-    coremltools_version=$(pip show coremltools | grep Version | awk '{print $2}')
-    coremltools_major_version=$(echo "$coremltools_version" | cut -d. -f1)
-    if [ "$coremltools_major_version" -lt 8 ]; then
+    coremltools_version=$(pip show coremltools | awk '/^Version:/{print $2; exit}')
+    coremltools_major_version=${coremltools_version%%.*}
+    if [ -n "$coremltools_major_version" ] && [ "$coremltools_major_version" -lt 8 ]; then
         echo "coremltools version 8.x or higher is required. Aborting. (Issue #9)"
         echo "Please refer to the troubleshooting guide in docs/troubleshooting.md for more information."
         exit 1
@@ -189,8 +189,8 @@ if [ "$SKIP_CHECK" = false ]; then
             exit 1
         fi
 
-        if [[ "$CONFIG_ARCH_LOWER" != *llama* && "$CONFIG_ARCH_LOWER" != *qwen* && "$CONFIG_MODEL_TYPE_LOWER" != *llama* && "$CONFIG_MODEL_TYPE_LOWER" != *qwen* ]]; then
-            echo "Unsupported architecture or model type in config.json. Supported types: llama, qwen. Aborting. (Issue #7)"
+        if [[ "$CONFIG_ARCH_LOWER" != *llama* && "$CONFIG_ARCH_LOWER" != *qwen* && "$CONFIG_ARCH_LOWER" != *phi* && "$CONFIG_MODEL_TYPE_LOWER" != *llama* && "$CONFIG_MODEL_TYPE_LOWER" != *qwen* && "$CONFIG_MODEL_TYPE_LOWER" != *phi* ]]; then
+            echo "Unsupported architecture or model type in config.json. Supported types: llama, qwen, phi. Aborting. (Issue #7)"
             echo "Detected architectures: $CONFIG_ARCH"
             echo "Detected model_type: $CONFIG_MODEL_TYPE"
             echo "(Lowercased: architectures='$CONFIG_ARCH_LOWER', model_type='$CONFIG_MODEL_TYPE_LOWER')"

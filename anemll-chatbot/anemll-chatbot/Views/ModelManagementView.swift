@@ -1396,6 +1396,7 @@ struct ModelManagementView: View {
             customModelName
         
         isAddingModel = false
+        let addedURL = customModelURL
         
         // Add the custom model
         Task {
@@ -1422,6 +1423,11 @@ struct ModelManagementView: View {
                     await MainActor.run {
                         successMessage = "Custom model '\(finalModelName)' added successfully."
                         showSuccess = true
+                        
+                        // Auto-select the newly added model (macOS folder imports and URLs)
+                        if let newlyAdded = modelService.getAvailableModels().last(where: { $0.downloadURL == addedURL || $0.name == finalModelName }) {
+                            modelService.selectModel(newlyAdded)
+                        }
                         
                         // Reset fields
                         customModelURL = ""
@@ -2021,6 +2027,16 @@ struct AvailableModelsSection: View {
                             .autocapitalization(.none)
                             .disableAutocorrection(true)
                         
+                        #if os(macOS)
+                        Button {
+                            chooseLocalFolder()
+                        } label: {
+                            Label("Choose Folder…", systemImage: "folder")
+                        }
+                        .buttonStyle(.bordered)
+                        .help("Select a local model folder (macOS)")
+                        #endif
+                        
                         TextField("Model Name (optional)", text: $customModelName)
                         
                         TextField("Model Description (optional)", text: $customModelDescription)
@@ -2066,6 +2082,27 @@ struct AvailableModelsSection: View {
                 isCustomModelSheetActive = false
             }
         }
+        
+        #if os(macOS)
+        private func chooseLocalFolder() {
+            let panel = NSOpenPanel()
+            panel.allowsMultipleSelection = false
+            panel.canChooseFiles = false
+            panel.canChooseDirectories = true
+            panel.canCreateDirectories = false
+            panel.prompt = "Choose"
+            panel.title = "Select Model Folder"
+            
+            if panel.runModal() == .OK, let url = panel.url {
+                // Use file URL for clarity
+                customModelURL = url.absoluteString
+                // Pre-fill name from folder if empty
+                if customModelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    customModelName = url.lastPathComponent
+                }
+            }
+        }
+        #endif
     }
 }
 
@@ -2619,4 +2656,3 @@ struct ActionButton: View {
         }
     }
 }
-

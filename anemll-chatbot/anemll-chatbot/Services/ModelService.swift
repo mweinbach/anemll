@@ -3795,57 +3795,152 @@ final class ModelService: NSObject, URLSessionDownloadDelegate, ObservableObject
         return availableModels.contains { $0.id == id }
     }
     
-    // Update custom model addition to prevent duplicates
+    // Update custom model addition to support macOS folder selection and prevent duplicates
     public func addCustomModel(name: String? = nil, description: String? = nil, downloadURL: String, completion: @escaping (Bool, String?) -> Void) {
-        print("Adding custom model from URL: \(downloadURL)")
-        
-        // Extract repository information from URL
-        guard let repoInfo = extractHuggingFaceRepoInfo(from: downloadURL) else {
-            completion(false, "Invalid Hugging Face URL format")
-            return
-        }
-        
-        // For HuggingFace repositories, use just the repository name as the ID (lowercase)
-        // This preserves the repository naming convention while avoiding duplication
-        let modelId = repoInfo.repoLowercase
-        print("Created model ID from repository name: \(modelId)")
-        print("Original case-sensitive repository name: \(repoInfo.repo)")
-        
-        // Check if a model with this ID already exists
-        if modelExists(withId: modelId) {
-            print("Model with ID \(modelId) already exists, not adding duplicate")
-            
-            // Find the existing model
-            if let existingModel = availableModels.first(where: { $0.id == modelId }) {
-                // We can't update name/description as they are 'let' properties
-                // Just refresh the download status
-                existingModel.refreshDownloadStatus()
-                
-                // Notify success but indicate it was already existing
-                completion(true, "Model already exists in your library")
+        print("Adding custom model from URL/path: \(downloadURL)")
+
+        // 1) Handle local folder path (macOS folder picker passes file URLs)
+        if downloadURL.hasPrefix("file://") || downloadURL.hasPrefix("/") {
+            let url: URL
+            if downloadURL.hasPrefix("file://") {
+                guard let u = URL(string: downloadURL) else {
+                    completion(false, "Invalid file URL")
+                    return
+                }
+                url = u
+            } else {
+                url = URL(fileURLWithPath: downloadURL)
+            }
+
+            var isDir: ObjCBool = false
+            guard fileManager.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+                completion(false, "Selected path is not a folder")
+                return
+            }
+
+            // Determine model ID from folder name, ensure uniqueness
+            let baseId = sanitizeModelId(url.lastPathComponent.lowercased())
+            let modelId = generateUniqueModelId(baseId: baseId)
+            let displayName = name ?? url.lastPathComponent
+            let modelDir = getModelPath(for: modelId)
+
+            // Copy folder contents into app's Models directory so the app can access without sandbox bookmarks
+            do {
+                try copyFolderContents(from: url, to: modelDir)
+
+                // Optionally ensure meta.yaml exists and record source
+                ensureConfigurationFile(modelId: modelId, modelDir: modelDir, sourceURL: url.absoluteString)
+
+                // Compute size
+                let totalSize = try computeDirectorySize(at: modelDir)
+
+                // Create and register the model
+                let localModel = Model(
+                    id: modelId,
+                    name: displayName,
+                    description: description ?? "Local model imported from folder",
+                    size: Int(totalSize),
+                    downloadURL: url.absoluteString
+                )
+
+                localModel.isDownloaded = true
+                availableModels.append(localModel)
+                updateCustomModelsInUserDefaults()
+                completion(true, nil)
+                return
+            } catch {
+                print("❌ Failed to import local model folder: \(error)")
+                completion(false, "Failed to import folder: \(error.localizedDescription)")
                 return
             }
         }
-        
-        // Create the new model with the extracted information
+
+        // 2) Otherwise, treat as Hugging Face repository URL
+        guard let repoInfo = extractHuggingFaceRepoInfo(from: downloadURL) else {
+            completion(false, "Invalid URL. Enter a Hugging Face URL or choose a local folder.")
+            return
+        }
+
+        // For HuggingFace repositories, use repository name as ID (lowercase)
+        let baseId = repoInfo.repoLowercase
+        let modelId = generateUniqueModelId(baseId: baseId)
+        print("Created model ID from repository name: \(modelId)")
+        print("Original case-sensitive repository name: \(repoInfo.repo)")
+
+        // If model with the final ID already exists, surface success and return
+        if modelExists(withId: modelId) {
+            print("Model with ID \(modelId) already exists, not adding duplicate")
+            if let existingModel = availableModels.first(where: { $0.id == modelId }) {
+                existingModel.refreshDownloadStatus()
+            }
+            completion(true, "Model already exists in your library")
+            return
+        }
+
         let customModel = Model(
             id: modelId,
-            name: name ?? "\(repoInfo.owner)/\(repoInfo.repo)",  // Use original case for display
+            name: name ?? "\(repoInfo.owner)/\(repoInfo.repo)",
             description: description ?? "Custom model from Hugging Face",
-            size: 0,  // We don't know the size yet
-            downloadURL: downloadURL  // Keep the original URL intact
+            size: 0,
+            downloadURL: downloadURL
         )
-        
-        // Add to available models
+
         availableModels.append(customModel)
-        
-        // Refresh the model's download status
         customModel.refreshDownloadStatus()
-        
-        // Save the updated list of available models
         updateCustomModelsInUserDefaults()
-        
         completion(true, nil)
+    }
+
+    // Generate a unique model ID avoiding collisions with existing models
+    private func generateUniqueModelId(baseId: String) -> String {
+        var candidate = baseId
+        var suffix = 2
+        while modelExists(withId: candidate) {
+            candidate = "\(baseId)-\(suffix)"
+            suffix += 1
+        }
+        return candidate
+    }
+
+    // Copy contents of a directory into destination directory (creates subdirectories as needed)
+    private func copyFolderContents(from source: URL, to destination: URL) throws {
+        // Ensure destination directory exists
+        if !fileManager.fileExists(atPath: destination.path) {
+            try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+        }
+
+        let resourceKeys: [URLResourceKey] = [.isDirectoryKey]
+        let enumerator = fileManager.enumerator(at: source, includingPropertiesForKeys: resourceKeys, options: [.skipsHiddenFiles])
+
+        while let itemURL = enumerator?.nextObject() as? URL {
+            let resourceValues = try itemURL.resourceValues(forKeys: Set(resourceKeys))
+            let relativePath = itemURL.path.replacingOccurrences(of: source.path + "/", with: "")
+            let destURL = destination.appendingPathComponent(relativePath)
+
+            if resourceValues.isDirectory == true {
+                if !fileManager.fileExists(atPath: destURL.path) {
+                    try fileManager.createDirectory(at: destURL, withIntermediateDirectories: true)
+                }
+            } else {
+                // Remove if existing then copy
+                if fileManager.fileExists(atPath: destURL.path) {
+                    try fileManager.removeItem(at: destURL)
+                }
+                try fileManager.copyItem(at: itemURL, to: destURL)
+            }
+        }
+    }
+
+    // Compute total directory size (bytes)
+    private func computeDirectorySize(at url: URL) throws -> Int64 {
+        var total: Int64 = 0
+        let enumerator = fileManager.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey], options: [.skipsHiddenFiles])
+        while let item = enumerator?.nextObject() as? URL {
+            let rv = try item.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
+            if rv.isDirectory == true { continue }
+            if let s = rv.fileSize { total += Int64(s) }
+        }
+        return total
     }
     
     // Add a method to clean up duplicate models
@@ -4585,4 +4680,3 @@ extension NSObject {
         return ObjectiveC.objc_getAssociatedObject(self, keyPointer)
     }
 }
-

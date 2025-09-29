@@ -148,6 +148,8 @@ if [ -f "$CONFIG_FILE" ]; then
         CONVERTER="python3 -m anemll.ane_converter.qwen_converter"
     elif [[ "$ARCH" == *llama* ]]; then
         CONVERTER="python3 -m anemll.ane_converter.llama_converter"
+    elif [[ "$ARCH" == *phi* ]]; then
+        CONVERTER="python3 -m anemll.ane_converter.phi_converter"
     else
         echo "Unsupported architecture or model type in config.json. Supported types: llama, qwen. Aborting. (Issue #7)"
         exit 1
@@ -325,6 +327,13 @@ if [ "$MODEL_PATH" != "$OUTPUT_DIR" ]; then
   \"model_type\": \"qwen3\"
 }
 EOF_CONFIG
+            elif [[ \"$ARCH\" == phi* ]]; then
+                cat > \"$OUTPUT_DIR/config.json\" <<'EOF_CONFIG'
+{
+  \"tokenizer_class\": \"AutoTokenizer\",
+  \"model_type\": \"phi3\"
+}
+EOF_CONFIG
             else
                 python3 -m anemll.ane_converter.create_config_json --output \"$OUTPUT_DIR/config.json\"
             fi
@@ -357,7 +366,12 @@ lmhead_path = f'{lmhead_name}.mlmodelc'
 ffn_path = f'{ffn_base}.mlmodelc'
 
 # Set split_lm_head based on architecture
-split_lm_head = 16 if ARCH.startswith('qwen') else 8
+if ARCH.startswith('qwen'):
+    split_lm_head = 16
+elif ARCH.startswith('phi'):
+    split_lm_head = 1
+else:
+    split_lm_head = 8
 
 meta = f'''model_info:
   name: anemll-{MODEL_NAME}-ctx{CONTEXT}
